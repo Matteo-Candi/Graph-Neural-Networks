@@ -1,8 +1,11 @@
 import networkx as nx
 import numpy as np
+import torch.nn as nn
+import torch.nn.functional as F
 import random
 import torch
 from sklearn.model_selection import StratifiedKFold
+from tqdm import tqdm
 
 class S2VGraph(object):
     def __init__(self, g, label, node_tags=None, node_features=None):
@@ -22,6 +25,7 @@ class S2VGraph(object):
         self.edge_mat = 0
 
         self.max_neighbor = 0
+
 
 
 def load_data(dataset, degree_as_tag):
@@ -125,6 +129,8 @@ def load_data(dataset, degree_as_tag):
 
     return g_list, len(label_dict)
 
+
+
 def separate_data(graph_list, seed, fold_idx):
     assert 0 <= fold_idx and fold_idx < 10, "fold_idx must be from 0 to 9."
     skf = StratifiedKFold(n_splits=10, shuffle = True, random_state = seed)
@@ -139,3 +145,73 @@ def separate_data(graph_list, seed, fold_idx):
     test_graph_list = [graph_list[i] for i in test_idx]
 
     return train_graph_list, test_graph_list
+
+
+
+def train(model, device, train_graphs, optimizer, epoch, iters_per_epoch, batch_size):
+    model.train()
+
+    total_iters = iters_per_epoch
+    pbar = tqdm(range(total_iters), unit='batch')
+
+    loss_accum = 0
+    criterion = nn.CrossEntropyLoss()
+    for pos in pbar:
+        selected_idx = np.random.permutation(len(train_graphs))[:batch_size]
+
+        batch_graph = [train_graphs[idx] for idx in selected_idx]
+        output = model(batch_graph)
+
+        labels = torch.LongTensor([graph.label for graph in batch_graph]).to(device)
+
+        #compute loss
+        loss = criterion(output, labels)
+
+        #backprop
+        if optimizer is not None:
+            optimizer.zero_grad()
+            loss.backward()         
+            optimizer.step()
+        
+
+        loss = loss.detach().cpu().numpy()
+        loss_accum += loss
+
+        #report
+        pbar.set_description('epoch: %d' % (epoch))
+
+    average_loss = loss_accum/total_iters
+    print("loss training: %f" % (average_loss))
+    
+    return average_loss
+
+# Pass data to model with minibatch during testing to avoid memory overflow (does not perform backpropagation).
+def pass_data_iteratively(model, graphs, minibatch_size = 64):
+    model.eval()
+    output = []
+    idx = np.arange(len(graphs))
+    for i in range(0, len(graphs), minibatch_size):
+        sampled_idx = idx[i:i+minibatch_size]
+        if len(sampled_idx) == 0:
+            continue
+        output.append(model([graphs[j] for j in sampled_idx]).detach())
+    return torch.cat(output, 0)
+
+def test(model, device, train_graphs, test_graphs, epoch):
+    model.eval()
+
+    output = pass_data_iteratively(model, train_graphs)
+    pred = output.max(1, keepdim=True)[1]
+    labels = torch.LongTensor([graph.label for graph in train_graphs]).to(device)
+    correct = pred.eq(labels.view_as(pred)).sum().cpu().item()
+    acc_train = correct / float(len(train_graphs))
+
+    output = pass_data_iteratively(model, test_graphs)
+    pred = output.max(1, keepdim=True)[1]
+    labels = torch.LongTensor([graph.label for graph in test_graphs]).to(device)
+    correct = pred.eq(labels.view_as(pred)).sum().cpu().item()
+    acc_test = correct / float(len(test_graphs))
+
+    print("accuracy train: %f test: %f" % (acc_train, acc_test))
+
+    return acc_train, acc_test
